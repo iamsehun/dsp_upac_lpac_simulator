@@ -32,57 +32,173 @@ const predictions = useMemo(() => {
     };
 }, [lpac, upac, lpacWeight, upacWeight]);
 
-// 고도화된 웨이퍼 형상 계산 함수
+// PCA 기반 웨이퍼 형상 계산 함수 (형상 일관성 보장)
 const calculateWaferThickness = (r, baseShape, upacVal, lpacVal) => {
     // 기준 UPAC/LPAC 값
     const baseUPAC = 33.0;
     const baseLPAC = 0.85;
 
-    // 기준 형상별 두께 프로파일
+    // 기준 형상별 두께 프로파일 (강한 형상 특성)
     let baseThickness;
     switch (baseShape) {
     case 'convex':
-        baseThickness = 774.2 - 0.5 * r * r;
+        // 볼록 형상: 중심이 높고 가장자리로 갈수록 낮아짐 (강화)
+        baseThickness = 774.5 - 0.8 * r * r; // 계수 증가로 볼록 특성 강화
         break;
     case 'flat':
         baseThickness = 774.0;
         break;
     case 'concave':
-        baseThickness = 773.8 + 0.5 * r * r;
+        // 오목 형상: 중심이 낮고 가장자리로 갈수록 높아짐 (강화)
+        baseThickness = 773.5 + 0.8 * r * r; // 계수 증가로 오목 특성 강화
         break;
     default:
         baseThickness = 774.0;
     }
 
-    // UPAC/LPAC 영향 계산 (감도 조정됨)
-    // UPAC: 중심부에 주로 영향 - 증가 시 중심 높아짐 (감도 75% 감소, 원래 대비 25%)
-    let deltaUPAC = 0;
-    if (baseShape === 'convex') {
-    // 볼록: UPAC 증가 → 중심 높아짐 → 볼록성 강화(악화)
-    deltaUPAC = (upacVal - baseUPAC) * (1 - r * r) * 0.0375; // 0.075 → 0.0375 (추가 50% 감소, 총 75% 감소)
-    } else if (baseShape === 'concave') {
-    // 오목: UPAC 증가 → 중심 높아짐 → 오목성 감소(평평해짐)
-    deltaUPAC = (upacVal - baseUPAC) * (1 - r * r) * 0.0375; // 0.075 → 0.0375 (추가 50% 감소, 총 75% 감소)
-    } else {
-    // 평평: UPAC 변화에 따른 중심부 변화
-    deltaUPAC = (upacVal - baseUPAC) * (1 - r * r) * 0.025; // 0.05 → 0.025 (추가 50% 감소, 총 75% 감소)
+    // UPAC/LPAC 정규화
+    const upac_norm = (upacVal - baseUPAC) / 15.0;
+    const lpac_norm = (lpacVal - baseLPAC) / 0.25;
+    
+    // 형상별 회귀 계수 (형상 일관성 보장)
+    let pc2_coeffs, pc3_coeffs;
+    
+    switch (baseShape) {
+    case 'convex':
+        // Convex: 볼록 특성 유지, 변곡 방지
+        pc2_coeffs = [0.0, 0.3, 0.15, 0.05, 0.08, 0.02];  // 중심부 효과 제한
+        pc3_coeffs = [0.0, 0.2, -0.3, -0.01, 0.1, 0.04];  // 가장자리 효과 제한
+        break;
+    case 'flat':
+        pc2_coeffs = [0.0, 0.35, 0.3, 0.05, 0.1, 0.02];
+        pc3_coeffs = [0.0, 0.2, -0.35, -0.03, 0.08, 0.05];
+        break;
+    case 'concave':
+        // Concave: 오목 특성 유지, 변곡 방지
+        pc2_coeffs = [0.0, 0.2, 0.25, 0.01, 0.06, 0.03];  // 중심부 효과 제한
+        pc3_coeffs = [0.0, 0.1, -0.2, -0.005, 0.04, 0.06]; // 오목 특성 보존
+        break;
     }
-
-    // LPAC: 가장자리에 주로 영향 - 증가 시 가장자리 두께 증가 (감도 6배 증가)
-    let deltaLPAC = 0;
-    if (baseShape === 'convex') {
-    // 볼록: LPAC 증가 → 가장자리 두께 증가 → 볼록성 감소(평평해짐)
-    deltaLPAC = (lpacVal - baseLPAC) * r * r * 1.2; // 0.4 → 1.2 (3배 추가 증가, 총 6배)
-    } else if (baseShape === 'concave') {
-    // 오목: LPAC 증가 → 가장자리 두께 증가 → 오목성 강화(악화)
-    deltaLPAC = (lpacVal - baseLPAC) * r * r * 1.2; // 0.4 → 1.2 (3배 추가 증가, 총 6배)
-    } else {
-    // 평평: LPAC 변화에 따른 가장자리 변화
-    deltaLPAC = (lpacVal - baseLPAC) * r * r * 0.9; // 0.3 → 0.9 (3배 추가 증가, 총 6배)
+    
+    // 2차 다항식 특성 생성
+    const poly_features = [
+    1,
+    upac_norm,
+    lpac_norm,
+    upac_norm * upac_norm,
+    upac_norm * lpac_norm,
+    lpac_norm * lpac_norm
+    ];
+    
+    // PC2, PC3 예측
+    let pc2 = 0, pc3 = 0;
+    for (let i = 0; i < poly_features.length; i++) {
+    pc2 += pc2_coeffs[i] * poly_features[i];
+    pc3 += pc3_coeffs[i] * poly_features[i];
     }
+    
+    // PCA 재구성 (형상 특성 보존)
+    let pca_reconstruction = 0;
+    
+    switch (baseShape) {
+    case 'convex':
+        // Convex: 중심부 높음 유지, 단조 감소 보장
+        const conv_center_factor = Math.exp(-2 * r * r); // 중심부에만 영향
+        const conv_edge_factor = r * r * (1 - 0.3 * Math.sin(r * Math.PI)); // 가장자리 부드러운 변화
+        
+        // 볼록 특성 보존: 중심에서 가장자리로 단조 감소
+        const conv_pc2_effect = pc2 * conv_center_factor * 0.3; // 중심부 제한적 변화
+        const conv_pc3_effect = pc3 * conv_edge_factor * 0.2;   // 가장자리 제한적 변화
+        
+        pca_reconstruction = conv_pc2_effect + conv_pc3_effect;
+        
+        // 볼록 특성 강제 보장 (변곡 방지)
+        if (r < 0.3) {
+        // 중심부는 항상 높게 유지
+        pca_reconstruction = Math.max(pca_reconstruction, -0.1);
+        } else {
+        // 가장자리는 중심보다 낮게 유지
+        pca_reconstruction = Math.min(pca_reconstruction, 0.1);
+        }
+        break;
+        
+    case 'flat':
+        const flat_comp2 = 0.25 * Math.sin(r * Math.PI) + 0.05 * (r - 0.5); // 진폭 축소
+        const flat_comp3 = 0.18 * Math.cos(r * Math.PI * 2) + 0.1 * r * r;   // 굴곡 완화
+        pca_reconstruction = pc2 * flat_comp2 + pc3 * flat_comp3;
+        break;
+        
+    case 'concave':
+        // Concave: 중심부 낮음 유지, 단조 증가 보장
+        const conc_center_factor = Math.exp(-1.5 * r * r); // 중심부에만 영향
+        const conc_edge_factor = r * r * (1 + 0.2 * Math.cos(r * Math.PI)); // 가장자리 부드러운 변화
+        
+        // 오목 특성 보존: 중심에서 가장자리로 단조 증가
+        const conc_pc2_effect = pc2 * conc_center_factor * 0.25; // 중심부 제한적 변화
+        const conc_pc3_effect = pc3 * conc_edge_factor * 0.3;    // 가장자리 적절한 변화
+        
+        pca_reconstruction = conc_pc2_effect + conc_pc3_effect;
+        
+        // 오목 특성 강제 보장 (변곡 방지)
+        if (r < 0.3) {
+        // 중심부는 항상 낮게 유지
+        pca_reconstruction = Math.min(pca_reconstruction, 0.1);
+        } else {
+        // 가장자리는 중심보다 높게 유지
+        pca_reconstruction = Math.max(pca_reconstruction, -0.1);
+        }
+        break;
+    }
+    
+    // 형상별 스케일링 (변화 제한)
+    let scale_factor;
+    switch (baseShape) {
+    case 'convex':
+        scale_factor = 3;  // 볼록 특성 보존을 위해 변화 제한
+        break;
+    case 'flat':
+        scale_factor = 1;
+        break;
+    case 'concave':
+        scale_factor = 3;  // 오목 특성 보존을 위해 변화 제한
+        break;
+    }
+    
+    const thickness_delta = pca_reconstruction * scale_factor;
 
-    // 최종 두께
-    return baseThickness + deltaUPAC + deltaLPAC;
+    // 최종 형상 검증 및 보정
+    let final_thickness = baseThickness + thickness_delta;
+    
+    // 형상 일관성 최종 검증
+    if (baseShape === 'flat' && r > 0.3 && r < 0.6) {
+        // 중앙 부근에서 급격한 변화 방지
+        const maxDelta = 0.25;
+        const relative = final_thickness - baseThickness;
+        if (relative > maxDelta) final_thickness = baseThickness + maxDelta;
+        else if (relative < -maxDelta) final_thickness = baseThickness - maxDelta;
+    }
+    else if (baseShape === 'convex') {
+    // 볼록 형상: 중심(r=0)이 가장자리(r=1)보다 항상 두꺼워야 함
+    const center_thickness = 774.5; // r=0일 때
+    const current_relative = final_thickness - (774.5 - 0.8 * r * r);
+    
+    // 중심부 근처에서 급격한 변화 방지
+    if (r < 0.4 && current_relative < -0.3) {
+        final_thickness = baseThickness - 0.3;
+    }
+    } else if (baseShape === 'concave') {
+    // 오목 형상: 중심(r=0)이 가장자리(r=1)보다 항상 얇아야 함
+    const center_thickness = 773.5; // r=0일 때
+    const current_relative = final_thickness - (773.5 + 0.8 * r * r);
+    
+    // 중심부 근처에서 급격한 변화 방지
+    if (r < 0.4 && current_relative > 0.3) {
+        final_thickness = baseThickness + 0.3;
+    }
+    }
+    
+
+    return final_thickness;
 };
 
 // 개별 웨이퍼 형상 그래프 컴포넌트 (반응형 디자인, 세로길이 15% 증가)
@@ -90,17 +206,18 @@ const WaferShapeGraph = ({ title, baseShape, shapeName }) => {
     const svgHeight = 92; // 80 → 92 (15% 증가)
 
     // 뷰박스 크기 설정 (고정값 기준)
-    const viewBoxWidth = 308;
-    const viewBoxHeight = 92; // 80 → 92 (15% 증가)
+    const viewBoxWidth = 250;
+    const viewBoxHeight = 150; // 80 → 92 (15% 증가)
     const centerX = viewBoxWidth / 2;
-    const centerY = viewBoxHeight / 2;
+    const centerY = viewBoxHeight / 1.5;
     const viewBoxDisplayRadius = 110;
 
-    // 기준 형상 생성
+    // 기준 형상 생성 - 부드러운 연결 강화
     const createReferenceShape = () => {
     const points = 50;
-    const refPoints = [];
+    const rawPoints = [];
     
+    // 1단계: 원시 데이터 포인트 생성
     for (let i = 0; i <= points; i++) {
         const ratio = i / points; // 0 to 1
         const x = centerX - viewBoxDisplayRadius + (ratio * viewBoxDisplayRadius * 2);
@@ -112,17 +229,63 @@ const WaferShapeGraph = ({ title, baseShape, shapeName }) => {
         // 시각적 높이 변환 (증폭)
         const height = 15 + (thickness - 774.0) * 50;
         const y = centerY - height;
-        refPoints.push(`${x},${y}`);
+        
+        rawPoints.push({ x, y, ratio, r });
     }
     
-    return `M ${refPoints.join(' L ')}`;
+    // 2단계: 가우시안 스무딩 적용
+    const smoothedPoints = rawPoints.map((point, index) => {
+        if (point.r < 0.3) { // 중심부 30% 영역 스무딩
+        let weightedSum = 0;
+        let totalWeight = 0;
+        
+        for (let j = Math.max(0, index - 2); j <= Math.min(points, index + 2); j++) {
+            const distance = Math.abs(j - index);
+            const weight = Math.exp(-distance * distance / (2 * 0.5 * 0.5));
+            weightedSum += rawPoints[j].y * weight;
+            totalWeight += weight;
+        }
+        
+        return {
+            ...point,
+            y: weightedSum / totalWeight
+        };
+        }
+        return point;
+    });
+    
+    // 3단계: 베지어 곡선으로 부드러운 경로 생성
+    if (smoothedPoints.length < 3) {
+        return `M ${smoothedPoints.map(p => `${p.x},${p.y}`).join(' L ')}`;
+    }
+    
+    let path = `M ${smoothedPoints[0].x},${smoothedPoints[0].y}`;
+    
+    for (let i = 1; i < smoothedPoints.length - 1; i++) {
+        const current = smoothedPoints[i];
+        const next = smoothedPoints[i + 1];
+        
+        if (current.r < 0.4) {
+        // 중심부는 베지어 곡선 사용
+        const cp1x = current.x + (next.x - current.x) * 0.3;
+        const cp1y = current.y;
+        const cp2x = next.x - (next.x - current.x) * 0.3;
+        const cp2y = next.y;
+        path += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${next.x},${next.y}`;
+        } else {
+        path += ` L ${next.x},${next.y}`;
+        }
+    }
+    
+    return path;
     };
 
-    // 변화된 형상 생성 (UPAC/LPAC 적용)
+    // 변화된 형상 생성 (UPAC/LPAC 적용) - 부드러운 연결 강화
     const createModifiedShape = () => {
     const points = 50;
-    const modPoints = [];
+    const rawPoints = [];
     
+    // 1단계: 원시 데이터 포인트 생성
     for (let i = 0; i <= points; i++) {
         const ratio = i / points; // 0 to 1
         const x = centerX - viewBoxDisplayRadius + (ratio * viewBoxDisplayRadius * 2);
@@ -134,10 +297,95 @@ const WaferShapeGraph = ({ title, baseShape, shapeName }) => {
         // 시각적 높이 변환 (증폭)
         const height = 15 + (thickness - 774.0) * 50;
         const y = centerY - height;
-        modPoints.push(`${x},${y}`);
+        
+        rawPoints.push({ x, y, ratio, r });
     }
     
-    return `M ${modPoints.join(' L ')}`;
+    // 2단계: 중심부 부드러운 연결을 위한 가우시안 스무딩
+    const smoothedPoints = rawPoints.map((point, index) => {
+        if (point.r < 0.3) { // 중심부 30% 영역에만 스무딩 적용
+        let weightedSum = 0;
+        let totalWeight = 0;
+        
+        // 가우시안 가중 평균 (3포인트 윈도우)
+        for (let j = Math.max(0, index - 2); j <= Math.min(points, index + 2); j++) {
+            const distance = Math.abs(j - index);
+            const weight = Math.exp(-distance * distance / (2 * 0.5 * 0.5)); // σ=0.5 가우시안
+            weightedSum += rawPoints[j].y * weight;
+            totalWeight += weight;
+        }
+        
+        return {
+            ...point,
+            y: weightedSum / totalWeight
+        };
+        }
+        return point;
+    });
+    
+    // 3단계: 중심부 대칭성 강화
+    const symmetricPoints = smoothedPoints.map((point, index) => {
+        if (point.r < 0.2) { // 중심부 20% 영역 대칭성 보장
+        const centerIndex = Math.floor(points / 2);
+        const distanceFromCenter = Math.abs(index - centerIndex);
+        
+        if (distanceFromCenter > 0) {
+            // 대칭 위치의 포인트와 평균
+            const symmetricIndex = centerIndex + (index < centerIndex ? distanceFromCenter : -distanceFromCenter);
+            if (symmetricIndex >= 0 && symmetricIndex <= points) {
+            const symmetricY = smoothedPoints[symmetricIndex].y;
+            return {
+                ...point,
+                y: (point.y + symmetricY) / 2
+            };
+            }
+        }
+        }
+        return point;
+    });
+    
+    // 4단계: 추가 스무딩 (전체적인 곡선 매끄러움)
+    const finalPoints = symmetricPoints.map((point, index) => {
+        if (index === 0 || index === points) return point; // 끝점은 유지
+        
+        // 3포인트 이동평균으로 전반적인 매끄러움 향상
+        const prevY = symmetricPoints[index - 1].y;
+        const nextY = symmetricPoints[index + 1] ? symmetricPoints[index + 1].y : point.y;
+        const smoothY = (prevY + point.y * 2 + nextY) / 4; // 중앙값에 가중치
+        
+        return {
+        ...point,
+        y: smoothY
+        };
+    });
+    
+    // 5단계: SVG 경로 생성 (베지어 곡선 사용)
+    if (finalPoints.length < 3) {
+        return `M ${finalPoints.map(p => `${p.x},${p.y}`).join(' L ')}`;
+    }
+    
+    // 베지어 곡선으로 부드러운 연결
+    let path = `M ${finalPoints[0].x},${finalPoints[0].y}`;
+    
+    for (let i = 1; i < finalPoints.length - 1; i++) {
+        const current = finalPoints[i];
+        const next = finalPoints[i + 1];
+        
+        // 제어점 계산 (부드러운 곡선을 위한)
+        const cp1x = current.x + (next.x - current.x) * 0.3;
+        const cp1y = current.y;
+        const cp2x = next.x - (next.x - current.x) * 0.3;
+        const cp2y = next.y;
+        
+        // 중심부는 더 부드러운 베지어 곡선 사용
+        if (current.r < 0.4) {
+        path += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${next.x},${next.y}`;
+        } else {
+        path += ` L ${next.x},${next.y}`;
+        }
+    }
+    
+    return path;
     };
 
     return (
@@ -225,8 +473,8 @@ const WaferSimulation = () => {
             </div>
             <div>
                 <strong>LPAC Effect:</strong> Lower pressure → edge thickness  
-                <br />• Convex: LPAC ↑ → Edge ↑ → Less convex
-                <br />• Concave: LPAC ↑ → Edge ↑ → More concave
+                <br />• Convex: LPAC ↑ → Center ↑ → More convex
+                <br />• Concave: LPAC ↑ → Center ↑ → Less concave
             </div>
             </div>
         </div>
@@ -324,8 +572,8 @@ const getGradientColor = (value) => {
 
 // 형상 변화 그래프 컴포넌트 (박스 없는 단순 버전)
 const ShapeGraphSimple = ({ title, values, type, showLabels = true, titlePosition = 'top' }) => {
-    const svgHeight = 140;
-    const padding = 40;
+    const svgHeight = 90;
+    const padding = 10;
 
     const normalizedValues = values.map(v => {
     const normalized = (v - 0) / (3 - 0);
